@@ -1,4 +1,6 @@
 using System;
+using System.Diagnostics;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using MQTTnet;
@@ -13,6 +15,7 @@ public class MqttService : IDisposable
 {
     private readonly AppSettings _settings;
     private readonly IMqttClient _mqttClient;
+    private readonly HardwareMonitorService _hardwareMonitor;
     private Timer? _publishTimer;
     private bool _isConnected;
 
@@ -21,9 +24,11 @@ public class MqttService : IDisposable
         _settings = settings;
         var factory = new MqttFactory();
         _mqttClient = factory.CreateMqttClient();
+        _hardwareMonitor = new HardwareMonitorService();
 
         _mqttClient.ConnectedAsync += OnConnectedAsync;
         _mqttClient.DisconnectedAsync += OnDisconnectedAsync;
+        _mqttClient.ApplicationMessageReceivedAsync += OnMessageReceivedAsync; // <-- Новая строка
     }
 
     public async Task StartAsync()
@@ -34,7 +39,6 @@ public class MqttService : IDisposable
             .WithClientId(_settings.Mqtt.ClientId)
             .WithCredentials(_settings.Mqtt.User, _settings.Mqtt.Password)
             .WithCleanSession()
-            // Настройка Last Will and Testament (LWT)
             .WithWillTopic($"{_settings.Mqtt.BaseTopic}/status")
             .WithWillPayload("OFFLINE")
             .WithWillQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
@@ -49,10 +53,13 @@ public class MqttService : IDisposable
         _isConnected = true;
         Log.Information("Успешно подключено к MQTT брокеру.");
         
-        // Публикуем ONLINE при подключении
         await PublishStatusAsync("ONLINE");
 
-        // Запускаем таймер периодической отправки данных
+        // <-- ПОДПИСКА НА КОМАНДЫ
+        var topic = $"{_settings.Mqtt.BaseTopic}/command";
+        await _mqttClient.SubscribeAsync(new MqttTopicFilterBuilder().WithTopic(topic).Build());
+        Log.Information($"Подписка на топик команд: {topic}");
+
         _publishTimer = new Timer(
             async _ => await PublishPeriodicDataAsync(), 
             null, 
@@ -64,11 +71,9 @@ public class MqttService : IDisposable
     private async Task OnDisconnectedAsync(MqttClientDisconnectedEventArgs e)
     {
         _isConnected = false;
-        Log.Warning("Соединение с MQTT брокером разорвано. Попытка переподключения через 5 сек...");
-        
+        Log.Warning("Соединение с MQTT брокером разорвано. Переподключение через 5 сек...");
         _publishTimer?.Dispose();
 
-        // Автоматическое переподключение
         await Task.Delay(5000);
         try
         {
@@ -80,18 +85,58 @@ public class MqttService : IDisposable
         }
     }
 
+    // <-- ОБРАБОТКА ВХОДЯЩИХ КОМАНД
+private Task OnMessageReceivedAsync(MqttApplicationMessageReceivedEventArgs e)
+    {
+        var topic = e.ApplicationMessage.Topic;
+        var payload = System.Text.Encoding.UTF8.GetString(e.ApplicationMessage.PayloadSegment);
+        Log.Information($"Получена команда по топику {topic}: {payload}");
+
+        if (topic.EndsWith("/command", StringComparison.OrdinalIgnoreCase))
+        {
+            switch (payload.ToLower().Trim())
+            {
+                case "shutdown":
+                    Log.Warning("Получена команда ВЫКЛЮЧЕНИЯ ПК.");
+                    ExecuteSystemCommand("/s /t 0");
+                    break;
+                case "reboot":
+                case "restart":
+                    Log.Warning("Получена команда ПЕРЕЗАГРУЗКИ ПК.");
+                    ExecuteSystemCommand("/r /t 0");
+                    break;
+                default:
+                    Log.Warning($"Неизвестная команда: {payload}");
+                    break;
+            }
+        }
+        
+        return Task.CompletedTask;
+    }
+    
+    private void ExecuteSystemCommand(string arguments)
+    {
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "shutdown",
+                Arguments = arguments,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            Process.Start(startInfo);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Не удалось выполнить системную команду. Возможно, недостаточно прав.");
+        }
+    }
+
     private async Task PublishStatusAsync(string status)
     {
         if (!_isConnected) return;
-        var message = new MqttApplicationMessageBuilder()
-            .WithTopic($"{_settings.Mqtt.BaseTopic}/status")
-            .WithPayload(status)
-            .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
-            .WithRetainFlag(true)
-            .Build();
-
-        await _mqttClient.PublishAsync(message);
-        Log.Information($"Опубликован статус: {status}");
+        await PublishSingleAsync($"{_settings.Mqtt.BaseTopic}/status", status, true);
     }
 
     private async Task PublishPeriodicDataAsync()
@@ -100,31 +145,41 @@ public class MqttService : IDisposable
 
         try
         {
-            // ЭТАП 1: Только версия и Uptime
-            var version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0.0";
+            // Обновляем данные с железа
+            _hardwareMonitor.Update();
+
+            var version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0";
             var uptime = TimeSpan.FromMilliseconds(Environment.TickCount64).ToString(@"dd\.hh\:mm\:ss");
+            
+            var cpuLoad = _hardwareMonitor.GetCpuLoad();
+            var ramLoad = _hardwareMonitor.GetRamLoad();
+            var cpuTemp = _hardwareMonitor.GetCpuTemperature();
+            var gpuTemp = _hardwareMonitor.GetGpuTemperature();
 
-            // Публикация версии
-            await PublishSingleAsync($"{_settings.Mqtt.BaseTopic}/info/version", version);
-            // Публикация Uptime
-            await PublishSingleAsync($"{_settings.Mqtt.BaseTopic}/info/uptime", uptime);
+            // Публикация данных (null преобразуем в строку "N/A" или пропускаем)
+            await PublishSingleAsync($"{_settings.Mqtt.BaseTopic}/info/version", version, true);
+            await PublishSingleAsync($"{_settings.Mqtt.BaseTopic}/info/uptime", uptime, true);
+            
+            if (cpuLoad.HasValue) await PublishSingleAsync($"{_settings.Mqtt.BaseTopic}/info/cpu", $"{cpuLoad}%", true);
+            if (ramLoad.HasValue) await PublishSingleAsync($"{_settings.Mqtt.BaseTopic}/info/ram", $"{ramLoad}%", true);
+            if (cpuTemp.HasValue) await PublishSingleAsync($"{_settings.Mqtt.BaseTopic}/info/temp/cpu", $"{cpuTemp}°C", true);
+            if (gpuTemp.HasValue) await PublishSingleAsync($"{_settings.Mqtt.BaseTopic}/info/temp/gpu", $"{gpuTemp}°C", true);
 
-            Log.Debug($"Опубликованы данные: Version={version}, Uptime={uptime}");
+            Log.Debug($"Опубликованы данные: CPU={cpuLoad}%, RAM={ramLoad}%, CPU_T={cpuTemp}°C, GPU_T={gpuTemp}°C");
         }
         catch (Exception ex)
         {
             Log.Error(ex, "Ошибка при публикации периодических данных.");
-
         }
     }
 
-    private async Task PublishSingleAsync(string topic, string payload)
+    private async Task PublishSingleAsync(string topic, string payload, bool retain = true)
     {
         var message = new MqttApplicationMessageBuilder()
             .WithTopic(topic)
             .WithPayload(payload)
             .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
-            .WithRetainFlag(true)
+            .WithRetainFlag(retain)
             .Build();
 
         await _mqttClient.PublishAsync(message);
@@ -132,8 +187,9 @@ public class MqttService : IDisposable
 
     public async Task StopAsync()
     {
-        Log.Information("Корректное завершение работы MQTT сервиса...");
+        Log.Information("Завершение работы MQTT сервиса...");
         _publishTimer?.Dispose();
+        _hardwareMonitor.Dispose();
         
         if (_isConnected)
         {
