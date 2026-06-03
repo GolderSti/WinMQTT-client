@@ -17,10 +17,12 @@ public class HardwareMonitorService : IDisposable
             IsCpuEnabled = true,
             IsGpuEnabled = true,
             IsMemoryEnabled = true,
-            IsMotherboardEnabled = false 
+            IsMotherboardEnabled = false // Отключаем, чтобы не засорять лог лишними данными платы
         };
         
         _computer.Open();
+        _computer.Accept(_updateVisitor);
+        
         Log.Information("Hardware Monitor инициализирован.");
     }
 
@@ -29,32 +31,33 @@ public class HardwareMonitorService : IDisposable
         _computer.Accept(_updateVisitor);
     }
 
-    public float? GetCpuLoad()
+    public float? GetCpuLoad() => GetSensorValue(HardwareType.Cpu, SensorType.Load, "CPU Total");
+    
+    public float? GetCpuTemperature() 
     {
-        return GetSensorValue(HardwareType.Cpu, SensorType.Load);
+        // Ищем именно так, как датчик называется в вашем логе
+        return GetSensorValue(HardwareType.Cpu, SensorType.Temperature, "Core (Tctl/Tdie)");
     }
-
-    public float? GetCpuTemperature()
+    
+    public float? GetGpuTemperature() 
     {
-        return GetSensorValue(HardwareType.Cpu, SensorType.Temperature, "CPU Package");
-    }
-
-    public float? GetGpuTemperature()
-    {
-        float? temp = GetSensorValue(HardwareType.GpuNvidia, SensorType.Temperature, "GPU Core");
+        // Для встроенной AMD Radeon Graphics датчика температуры обычно не существует.
+        // Оставляем поиск на всякий случай, но ожидаемо получим null.
+        float? temp = GetSensorValue(HardwareType.GpuAmd, SensorType.Temperature, "GPU Core");
         if (temp == null)
         {
-            temp = GetSensorValue(HardwareType.GpuAmd, SensorType.Temperature, "GPU Core");
+            temp = GetSensorValue(HardwareType.GpuNvidia, SensorType.Temperature, "GPU Core");
         }
         return temp;
     }
-
-    public float? GetRamLoad()
+    
+    public float? GetRamLoad() 
     {
-        return GetSensorValue(HardwareType.Memory, SensorType.Load);
+        // В логе есть "Total Memory" и "Virtual Memory". Берем общую загрузку памяти.
+        return GetSensorValue(HardwareType.Memory, SensorType.Load, "Total Memory") 
+               ?? GetSensorValue(HardwareType.Memory, SensorType.Load);
     }
 
-    // ИСПРАВЛЕНИЕ 1: Добавлен '?' к string, чтобы разрешить null
     private float? GetSensorValue(HardwareType hardwareType, SensorType sensorType, string? nameContains = null)
     {
         foreach (var hardware in _computer.Hardware)
@@ -69,7 +72,6 @@ public class HardwareMonitorService : IDisposable
                         {
                             if (sensor.Value.HasValue)
                             {
-                                // ИСПРАВЛЕНИЕ 2: Явное приведение double к float
                                 return (float)Math.Round(sensor.Value.Value, 1);
                             }
                         }

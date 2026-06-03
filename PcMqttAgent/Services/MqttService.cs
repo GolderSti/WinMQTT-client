@@ -143,9 +143,8 @@ private Task OnMessageReceivedAsync(MqttApplicationMessageReceivedEventArgs e)
     {
         if (!_isConnected) return;
 
-        try
+try
         {
-            // Обновляем данные с железа
             _hardwareMonitor.Update();
 
             var version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0";
@@ -156,7 +155,6 @@ private Task OnMessageReceivedAsync(MqttApplicationMessageReceivedEventArgs e)
             var cpuTemp = _hardwareMonitor.GetCpuTemperature();
             var gpuTemp = _hardwareMonitor.GetGpuTemperature();
 
-            // Публикация данных (null преобразуем в строку "N/A" или пропускаем)
             await PublishSingleAsync($"{_settings.Mqtt.BaseTopic}/info/version", version, true);
             await PublishSingleAsync($"{_settings.Mqtt.BaseTopic}/info/uptime", uptime, true);
             
@@ -165,9 +163,9 @@ private Task OnMessageReceivedAsync(MqttApplicationMessageReceivedEventArgs e)
             if (cpuTemp.HasValue) await PublishSingleAsync($"{_settings.Mqtt.BaseTopic}/info/temp/cpu", $"{cpuTemp}°C", true);
             if (gpuTemp.HasValue) await PublishSingleAsync($"{_settings.Mqtt.BaseTopic}/info/temp/gpu", $"{gpuTemp}°C", true);
 
-            Log.Debug($"Опубликованы данные: CPU={cpuLoad}%, RAM={ramLoad}%, CPU_T={cpuTemp}°C, GPU_T={gpuTemp}°C");
-        }
-        catch (Exception ex)
+            // ИЗМЕНЕНО: Log.Information вместо Log.Debug
+            Log.Information($"Статус: CPU={cpuLoad?.ToString() ?? "N/A"}%, RAM={ramLoad?.ToString() ?? "N/A"}%, CPU_T={cpuTemp?.ToString() ?? "N/A"}°C, GPU_T={gpuTemp?.ToString() ?? "N/A"}°C");
+        }        catch (Exception ex)
         {
             Log.Error(ex, "Ошибка при публикации периодических данных.");
         }
