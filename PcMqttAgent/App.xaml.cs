@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
@@ -12,6 +12,8 @@ namespace PcMqttAgent;
 
 public partial class App : Application
 {
+    private bool _isSessionEnding;
+
     public static AppSettings Settings { get; private set; } = new();
     public static MqttService? MqttService { get; private set; }
     public static HardwareMonitorService? HardwareMonitor { get; private set; }
@@ -129,13 +131,37 @@ public partial class App : Application
         }
     }
 
+    protected override void OnSessionEnding(SessionEndingCancelEventArgs e)
+    {
+        _isSessionEnding = true;
+        Log.Warning($"Windows завершает сеанс ({e.ReasonSessionEnding}).");
+
+        if (MqttService != null)
+        {
+            try
+            {
+                MqttService.HandleSessionEndingAsync().GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "Ошибка обработки SessionEnding. Продолжаем завершение сеанса, рассчитывая на LWT.");
+            }
+        }
+
+        base.OnSessionEnding(e);
+    }
+
     protected override async void OnExit(ExitEventArgs e)
     {
         Log.Information("Завершение работы...");
-        if (MqttService != null) await MqttService.StopAsync();
+
+        if (!_isSessionEnding && MqttService != null)
+        {
+            await MqttService.StopAsync();
+        }
+
         HardwareMonitor?.Dispose();
         Log.CloseAndFlush();
         base.OnExit(e);
-        Environment.Exit(0);
     }
 }

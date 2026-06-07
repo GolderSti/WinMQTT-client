@@ -109,8 +109,7 @@ public class MqttService : IDisposable
             if (payload.Equals("OFF", StringComparison.OrdinalIgnoreCase))
             {
                 Log.Warning("Получена команда ВЫКЛЮЧЕНИЯ ПК через топик управления питанием.");
-                await PrepareForPowerStateChangeAsync();
-                ExecuteSystemCommand("/s /f /t 0"); // /f принудительно закрывает приложения
+                ExecuteSystemCommand("/s /f /t 0");
             }
             return;
         }
@@ -121,13 +120,11 @@ public class MqttService : IDisposable
             {
                 case "shutdown":
                     Log.Warning("Получена команда ВЫКЛЮЧЕНИЯ ПК.");
-                    await PrepareForPowerStateChangeAsync();
                     ExecuteSystemCommand("/s /f /t 0");
                     break;
                 case "reboot":
                 case "restart":
                     Log.Warning("Получена команда ПЕРЕЗАГРУЗКИ ПК.");
-                    await PrepareForPowerStateChangeAsync();
                     ExecuteSystemCommand("/r /f /t 0");
                     break;
                 default:
@@ -139,39 +136,58 @@ public class MqttService : IDisposable
 
     private async Task PrepareForPowerStateChangeAsync()
     {
+        await PublishOffAndDisconnectAsync().ConfigureAwait(false);
+    }
+
+    public async Task HandleSessionEndingAsync()
+    {
+        Log.Warning("Получено уведомление SessionEnding. Публикуем OFF и отключаемся от MQTT перед завершением сеанса.");
+        await PublishOffAndDisconnectAsync().ConfigureAwait(false);
+    }
+
+    private async Task PublishOffAndDisconnectAsync()
+    {
         _isStopping = true;
         _publishTimer?.Dispose();
 
         if (!_isConnected) return;
 
+        var publishSucceeded = false;
         try
         {
-            await PublishPowerStateAsync("OFF").WaitAsync(MqttPowerChangeTimeout);
+            await PublishPowerStateAsync("OFF").WaitAsync(MqttPowerChangeTimeout).ConfigureAwait(false);
+            publishSucceeded = true;
         }
         catch (TimeoutException)
         {
-            Log.Warning($"Публикация OFF в топик {PowerTopic} не завершилась за {MqttPowerChangeTimeout.TotalSeconds} сек. Продолжаем выполнение команды питания.");
+            Log.Warning($"Публикация OFF в топик {PowerTopic} не завершилась за {MqttPowerChangeTimeout.TotalSeconds} сек. Отказываемся от DISCONNECT и рассчитываем на LWT.");
         }
         catch (Exception ex)
         {
-            Log.Error(ex, $"Не удалось опубликовать OFF в {PowerTopic} перед изменением состояния питания.");
+            Log.Error(ex, $"Не удалось опубликовать OFF в {PowerTopic}.");
+        }
+
+        if (!publishSucceeded)
+        {
+            Log.Warning("DISCONNECT не отправлен: брокер получит LWT при нештатном разрыве TCP-соединения.");
+            return;
         }
 
         try
         {
-            await _mqttClient.DisconnectAsync().WaitAsync(MqttPowerChangeTimeout);
+            await _mqttClient.DisconnectAsync().WaitAsync(MqttPowerChangeTimeout).ConfigureAwait(false);
         }
         catch (TimeoutException)
         {
-            Log.Warning($"Отключение от MQTT брокера не завершилось за {MqttPowerChangeTimeout.TotalSeconds} сек. Продолжаем выполнение команды питания.");
+            Log.Warning($"Отключение от MQTT брокера не завершилось за {MqttPowerChangeTimeout.TotalSeconds} сек.");
         }
         catch (Exception ex)
         {
-            Log.Warning(ex, "Не удалось штатно отключиться от MQTT, продолжаем выключение.");
+            Log.Warning(ex, $"Не удалось штатно отключиться от MQTT.");
         }
     }
 
-    private void ExecuteSystemCommand(string arguments)
+    private bool ExecuteSystemCommand(string arguments)
     {
         try
         {
@@ -184,19 +200,28 @@ public class MqttService : IDisposable
                 CreateNoWindow = true,
                 WindowStyle = ProcessWindowStyle.Hidden
             };
-            Process.Start(startInfo);
-            Log.Information("Команда shutdown.exe успешно передана ОС.");
+            using var process = Process.Start(startInfo);
+
+            if (process == null)
+            {
+                Log.Error("Не удалось запустить shutdown.exe: Process.Start вернул null. Приложение остаётся онлайн.");
+                return false;
+            }
+
+            Log.Information("Команда shutdown.exe успешно передана ОС. Ожидаем SessionEnding для публикации OFF и отключения от брокера.");
+            return true;
         }
         catch (Exception ex)
         {
-            Log.Error(ex, "КРИТИЧЕСКАЯ ОШИБКА: Не удалось запустить shutdown.exe.");
+            Log.Error(ex, "КРИТИЧЕСКАЯ ОШИБКА: Не удалось запустить shutdown.exe. Приложение остаётся онлайн.");
+            return false;
         }
     }
 
     private async Task PublishPowerStateAsync(string state)
     {
         if (!_isConnected) return;
-        await PublishSingleAsync(PowerTopic, state, true);
+        await PublishSingleAsync(PowerTopic, state, true).ConfigureAwait(false);
     }
 
     private async Task PublishPeriodicDataAsync()
@@ -251,12 +276,12 @@ public class MqttService : IDisposable
             .WithRetainFlag(retain)
             .Build();
 
-        await _mqttClient.PublishAsync(message);
+        await _mqttClient.PublishAsync(message).ConfigureAwait(false);
     }
 
     public async Task StopAsync()
     {
-        Log.Information("Завершение работы MQTT сервиса...");
+        Log.Information("Завершение работы MQTT сервиса из события on_exit...");
         await PrepareForPowerStateChangeAsync();
     }
 
