@@ -10,10 +10,10 @@
 - 📊 **Мониторинг ПК** — загрузка CPU/RAM, uptime и температуры через `LibreHardwareMonitor`.
 - 📡 **MQTT-интеграция**:
   - автоматическое переподключение при обрыве связи;
-  - поддержка **Last Will and Testament (LWT)** для публикации `OFFLINE` при аварийном отключении;
+  - поддержка **Last Will and Testament (LWT)** для публикации `OFF` в `/MAINPC/POWER` при аварийном отключении;
   - публикация показателей с настраиваемым интервалом;
   - retained-сообщения для актуального состояния после переподключения клиента.
-- 🎮 **Удалённое управление** — выключение и перезагрузка ПК через MQTT-топик команд.
+- 🎮 **Удалённое управление** — выключение и перезагрузка ПК через MQTT-топик команд, а также выключение через `/MAINPC/POWER/SET`.
 - ⚙️ **Настройка через JSON** — параметры MQTT, интервала публикации и логирования хранятся в `appsettings.json`.
 - 📝 **Логирование** — файловые логи с ежедневной ротацией через `Serilog`.
 
@@ -97,7 +97,7 @@ dotnet run --project PcMqttAgent/PcMqttAgent.csproj
 
 | Топик | Описание | Пример значения | Retain |
 | --- | --- | --- | --- |
-| `MAINPC/status` | Статус подключения | `ONLINE` / `OFFLINE` | ✅ Да |
+| `/MAINPC/POWER` | Состояние питания/LWT: при подключении публикуется `ON`, при штатном завершении и LWT — `OFF` | `ON` / `OFF` | ✅ Да |
 | `MAINPC/info/version` | Версия приложения | `1.0.0.0` | ✅ Да |
 | `MAINPC/info/uptime` | Время работы системы | `00.05:30:15` | ✅ Да |
 | `MAINPC/info/cpu` | Загрузка процессора | `15.5%` | ✅ Да |
@@ -109,18 +109,19 @@ dotnet run --project PcMqttAgent/PcMqttAgent.csproj
 
 ### 📥 Команды: Broker → Agent
 
-Отправьте payload в топик `MAINPC/command`:
+Для выключения ПК отправьте payload `OFF` в топик `/MAINPC/POWER/SET`. Старый топик `MAINPC/command` также поддерживается:
 
-| Payload | Действие |
-| --- | --- |
-| `shutdown` | Немедленное выключение ПК |
-| `reboot` | Немедленная перезагрузка ПК |
-| `restart` | Немедленная перезагрузка ПК |
+| Топик | Payload | Действие |
+| --- | --- | --- |
+| `/MAINPC/POWER/SET` | `OFF` | Немедленное выключение ПК |
+| `MAINPC/command` | `shutdown` | Немедленное выключение ПК |
+| `MAINPC/command` | `reboot` | Немедленная перезагрузка ПК |
+| `MAINPC/command` | `restart` | Немедленная перезагрузка ПК |
 
 Пример через `mosquitto_pub`:
 
 ```bash
-mosquitto_pub -h mqtt-server.lan -t MAINPC/command -m reboot
+mosquitto_pub -h mqtt-server.lan -t /MAINPC/POWER/SET -m OFF
 ```
 
 ## 🔄 Автозапуск с правами администратора без UAC
