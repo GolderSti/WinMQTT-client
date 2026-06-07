@@ -1,0 +1,25 @@
+<Window x:Class="PcMqttAgent.ShutdownWarningWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Внимание!" 
+        SizeToContent="WidthAndHeight"
+        WindowStartupLocation="CenterScreen"
+        Topmost="True"
+        ResizeMode="NoResize"
+        WindowStyle="ToolWindow">
+    <StackPanel Margin="25">
+        <TextBlock x:Name="TxtMessage" FontSize="16" TextWrapping="Wrap" Margin="0,0,0,20" TextAlignment="Center"/>
+        
+        <TextBlock x:Name="TxtTimer" 
+                   FontSize="32" 
+                   FontWeight="Bold" 
+                   Foreground="Red" 
+                   HorizontalAlignment="Center" 
+                   Margin="0,0,0,25"/>
+        
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+            <Button Content="Выполнить сейчас" Width="130" Height="35" Margin="5" Click="Ok_Click" IsDefault="True"/>
+            <Button Content="Отмена" Width="130" Height="35" Margin="5" Click="Cancel_Click" IsCancel="True"/>
+        </StackPanel>
+    </StackPanel>
+</Window>
