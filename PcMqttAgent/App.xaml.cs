@@ -1,5 +1,7 @@
 ﻿using System;
 using System.IO;
+using System.Linq;
+using System.Text.Json;
 using System.Windows;
 using Microsoft.Extensions.Configuration;
 using PcMqttAgent.Models;
@@ -10,9 +12,9 @@ namespace PcMqttAgent;
 
 public partial class App : Application
 {
-    // Статические свойства для глобального доступа
     public static AppSettings Settings { get; private set; } = new();
     public static MqttService? MqttService { get; private set; }
+    public static HardwareMonitorService? HardwareMonitor { get; private set; }
 
     protected override async void OnStartup(StartupEventArgs e)
     {
@@ -26,14 +28,10 @@ public partial class App : Application
                 .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
                 .Build();
 
-            // Современный способ привязки в .NET 8/9
             var loadedSettings = config.Get<AppSettings>();
-            if (loadedSettings != null)
-            {
-                Settings = loadedSettings;
-            }
+            if (loadedSettings != null) Settings = loadedSettings;
 
-            // Создаем папку для логов, если её нет
+            // Создаем папку для логов
             var logDir = Path.GetDirectoryName(Settings.Logging.FilePath);
             if (!string.IsNullOrEmpty(logDir) && !Directory.Exists(logDir))
             {
@@ -51,53 +49,93 @@ public partial class App : Application
                 .CreateLogger();
 
             Log.Information("=== Приложение PcMqttAgent запущено ===");
-            Log.Information($"Загружены настройки: Server={Settings.Mqtt.Server}, ClientId={Settings.Mqtt.ClientId}");
 
-            // 3. Запуск MQTT сервиса
+            // 3. Инициализация монитора железа
+            HardwareMonitor = new HardwareMonitorService();
+
+            // 4. АВТООБНОВЛЕНИЕ КОНФИГУРАЦИИ ДАТЧИКОВ
+            SyncSensorConfig();
+
+            // 5. Запуск MQTT
             MqttService = new MqttService(Settings);
             await MqttService.StartAsync();
 
-            // 4. Показываем главное окно (оно скрыто, но нужно для жизни приложения и трея)
+            // 6. Показываем главное окно (скрытое)
             var mainWindow = new MainWindow();
             mainWindow.Show(); 
         }
         catch (Exception ex)
         {
-            // 1. Пишем в консоль (видно в терминале VS Code)
             Console.WriteLine($"КРИТИЧЕСКАЯ ОШИБКА ЗАПУСКА: {ex}");
-            
-            // 2. Пишем в файл crash.log рядом с exe, чтобы точно не потерять
-            try 
-            {
-                File.WriteAllText("crash.log", ex.ToString());
-            } 
-            catch { /* Игнорируем ошибки записи лога */ }
-
-            // 3. Пытаемся показать окно
-            try 
-            {
-                MessageBox.Show($"Ошибка запуска приложения:\n{ex.Message}\n\nПодробности в файле crash.log", 
-                                "Критическая ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
-            } 
-            catch { /* Игнорируем */ }
-            
+            try { File.WriteAllText("crash.log", ex.ToString()); } catch { }
+            MessageBox.Show($"Ошибка запуска:\n{ex.Message}\n\nСм. crash.log", "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
             Current.Shutdown();
+        }
+    }
+
+    private void SyncSensorConfig()
+    {
+        Log.Information("Синхронизация конфигурации датчиков...");
+        bool configChanged = false;
+        var availableSensors = HardwareMonitor!.GetAllAvailableSensors();
+
+        foreach (var avail in availableSensors)
+        {
+            // Проверяем, есть ли уже такой датчик в конфиге
+            bool exists = Settings.Sensors.Any(s => 
+                s.HardwareType.Equals(avail.HardwareType, StringComparison.OrdinalIgnoreCase) &&
+                s.SensorType.Equals(avail.SensorType, StringComparison.OrdinalIgnoreCase) &&
+                s.SensorName.Equals(avail.SensorName, StringComparison.OrdinalIgnoreCase));
+
+            if (!exists)
+            {
+                // Добавляем новый датчик с Enabled = false
+                Settings.Sensors.Add(new SensorConfig
+                {
+                    HardwareType = avail.HardwareType,
+                    SensorType = avail.SensorType,
+                    SensorName = avail.SensorName,
+                    TopicSuffix = $"auto/{avail.HardwareType.ToLower()}_{avail.SensorType.ToLower()}",
+                    Enabled = false // По умолчанию выключен, как вы и просили
+                });
+                configChanged = true;
+                Log.Information($"Обнаружен новый датчик: [{avail.HardwareType}] {avail.SensorName} (добавлен в конфиг как Disabled)");
+            }
+        }
+
+        if (configChanged)
+        {
+            SaveConfig();
+            Log.Information("Файл appsettings.json обновлен новыми датчиками.");
+        }
+        else
+        {
+            Log.Information("Конфигурация датчиков актуальна.");
+        }
+    }
+
+    private void SaveConfig()
+    {
+        try
+        {
+            var options = new JsonSerializerOptions { WriteIndented = true };
+            var json = JsonSerializer.Serialize(Settings, options);
+            string configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "appsettings.json");
+            File.WriteAllText(configPath, json);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Не удалось сохранить appsettings.json");
         }
     }
 
     protected override async void OnExit(ExitEventArgs e)
     {
-        Log.Information("Начало корректного завершения работы...");
-        
-        if (MqttService != null)
-        {
-            await MqttService.StopAsync();
-        }
-        
-        Log.Information("Приложение завершено.");
+        Log.Information("Завершение работы...");
+        if (MqttService != null) await MqttService.StopAsync();
+        HardwareMonitor?.Dispose();
         Log.CloseAndFlush();
-        
         base.OnExit(e);
-        Environment.Exit(0); // Гарантируем полный выход из процесса
+        Environment.Exit(0);
     }
 }
