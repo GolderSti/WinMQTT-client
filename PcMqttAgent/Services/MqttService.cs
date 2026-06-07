@@ -4,6 +4,7 @@ using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Windows; // Добавлено для доступа к Application.Current.Dispatcher
 using MQTTnet;
 using MQTTnet.Client;
 using MQTTnet.Protocol;
@@ -23,6 +24,8 @@ public class MqttService : IDisposable
 
     private string PowerTopic => $"/{_settings.Mqtt.BaseTopic.Trim('/')}/POWER";
     private string PowerSetTopic => $"/{_settings.Mqtt.BaseTopic.Trim('/')}/POWER/SET";
+    private string CommandTopic => $"{_settings.Mqtt.BaseTopic}/command";
+    private string AckTopic => $"{_settings.Mqtt.BaseTopic}/command/ack";
 
     public MqttService(AppSettings settings)
     {
@@ -57,27 +60,44 @@ public class MqttService : IDisposable
         _isConnected = true;
         Log.Information("Успешно подключено к MQTT брокеру.");
         
-        await PublishPowerStateAsync("ON");
+        await PublishPowerStateAsync("ON").ConfigureAwait(false);
 
-        var commandTopic = $"{_settings.Mqtt.BaseTopic}/command";
-        await _mqttClient.SubscribeAsync(new MqttTopicFilterBuilder().WithTopic(commandTopic).Build());
-        Log.Information($"Подписка на топик команд: {commandTopic}");
+        await _mqttClient.SubscribeAsync(new MqttTopicFilterBuilder().WithTopic(CommandTopic).Build()).ConfigureAwait(false);
+        Log.Information($"Подписка на топик команд: {CommandTopic}");
 
-        await _mqttClient.SubscribeAsync(new MqttTopicFilterBuilder().WithTopic(PowerSetTopic).Build());
+        await _mqttClient.SubscribeAsync(new MqttTopicFilterBuilder().WithTopic(PowerSetTopic).Build()).ConfigureAwait(false);
         Log.Information($"Подписка на топик управления питанием: {PowerSetTopic}");
 
-        _publishTimer = new Timer(
-            async _ => await PublishPeriodicDataAsync(), 
-            null, 
-            TimeSpan.Zero, 
-            TimeSpan.FromSeconds(_settings.Publisher.IntervalSeconds)
-        );
+        // УЛУЧШЕНИЕ 1: Очищаем retain-команды с брокера сразу после подписки
+        await ClearRetainedCommandsAsync().ConfigureAwait(false);
+
+        if (_publishTimer == null)
+        {
+            _publishTimer = new Timer(
+                async _ => await PublishPeriodicDataAsync().ConfigureAwait(false), 
+                null, 
+                TimeSpan.Zero, 
+                TimeSpan.FromSeconds(_settings.Publisher.IntervalSeconds)
+            );
+        }
+        else
+        {
+            _publishTimer.Change(TimeSpan.Zero, TimeSpan.FromSeconds(_settings.Publisher.IntervalSeconds));
+        }
+    }
+
+    // УЛУЧШЕНИЕ 1: Публикация пустого сообщения с retain=true удаляет старое retain-сообщение с брокера
+    private async Task ClearRetainedCommandsAsync()
+    {
+        await PublishSingleAsync(CommandTopic, "", true).ConfigureAwait(false);
+        await PublishSingleAsync(PowerSetTopic, "", true).ConfigureAwait(false);
+        Log.Information("Retain-команды на брокере очищены.");
     }
 
     private async Task OnDisconnectedAsync(MqttClientDisconnectedEventArgs e)
     {
         _isConnected = false;
-        _publishTimer?.Dispose();
+        _publishTimer?.Change(Timeout.Infinite, Timeout.Infinite);
 
         if (_isStopping)
         {
@@ -86,10 +106,10 @@ public class MqttService : IDisposable
         }
 
         Log.Warning("Соединение разорвано. Переподключение через 5 сек...");
-        await Task.Delay(5000);
+        await Task.Delay(5000).ConfigureAwait(false);
         try
         {
-            await _mqttClient.ConnectAsync(_mqttClient.Options, CancellationToken.None);
+            await _mqttClient.ConnectAsync(_mqttClient.Options, CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -100,37 +120,67 @@ public class MqttService : IDisposable
     private async Task OnMessageReceivedAsync(MqttApplicationMessageReceivedEventArgs e)
     {
         var payload = Encoding.UTF8.GetString(e.ApplicationMessage.PayloadSegment)
-                                   .Replace("\n", "").Replace("\r", "").Trim();
+                                    .Replace("\n", "").Replace("\r", "").Trim();
         var topic = e.ApplicationMessage.Topic;
+
+        // ИГНОРИРУЕМ пустые сообщения (это наша же очистка retain или мусор)
+        if (string.IsNullOrWhiteSpace(payload)) return;
+
         Log.Information($"Получена команда по топику {topic}: '{payload}'");
+
+        // УЛУЧШЕНИЕ 3: Отправляем подтверждение получения команды
+        await PublishAckAsync(payload).ConfigureAwait(false);
 
         if (topic.Equals(PowerSetTopic, StringComparison.OrdinalIgnoreCase))
         {
             if (payload.Equals("OFF", StringComparison.OrdinalIgnoreCase))
             {
-                Log.Warning("Получена команда ВЫКЛЮЧЕНИЯ ПК через топик управления питанием.");
-                ExecuteSystemCommand("/s /f /t 0");
+                await ProcessPowerCommandAsync("shutdown", "/s /f /t 0").ConfigureAwait(false);
             }
             return;
         }
 
-        if (topic.EndsWith("/command", StringComparison.OrdinalIgnoreCase))
+        if (topic.Equals(CommandTopic, StringComparison.OrdinalIgnoreCase))
         {
             switch (payload.ToLowerInvariant())
             {
                 case "shutdown":
-                    Log.Warning("Получена команда ВЫКЛЮЧЕНИЯ ПК.");
-                    ExecuteSystemCommand("/s /f /t 0");
+                    await ProcessPowerCommandAsync("shutdown", "/s /f /t 0").ConfigureAwait(false);
                     break;
                 case "reboot":
                 case "restart":
-                    Log.Warning("Получена команда ПЕРЕЗАГРУЗКИ ПК.");
-                    ExecuteSystemCommand("/r /f /t 0");
+                    await ProcessPowerCommandAsync("reboot", "/r /f /t 0").ConfigureAwait(false);
                     break;
                 default:
                     Log.Warning($"Неизвестная команда: '{payload}'");
                     break;
             }
+        }
+    }
+
+    // УЛУЧШЕНИЕ 2: Асинхронный вызов UI-диалога через Dispatcher
+    private async Task ProcessPowerCommandAsync(string actionName, string shutdownArgs)
+    {
+        Log.Warning($"Инициализация процесса {actionName.ToUpper()} с предупреждением пользователя.");
+
+        // Вызываем WPF окно в главном UI-потоке
+        bool? userConfirmed = await Application.Current.Dispatcher.InvokeAsync(() =>
+        {
+            var dialog = new ShutdownWarningWindow(actionName);
+            return dialog.ShowDialog();
+        });
+
+        if (userConfirmed == true)
+        {
+            Log.Information("Пользователь подтвердил действие (или истек таймер). Выполнение...");
+            // await PrepareForPowerStateChangeAsync().ConfigureAwait(false);
+            ExecuteSystemCommand(shutdownArgs);
+        }
+        else
+        {
+            Log.Information("Пользователь отменил действие.");
+            // УЛУЧШЕНИЕ 3: Отправляем сообщение об отмене
+            await PublishCanceledAsync(actionName).ConfigureAwait(false);
         }
     }
 
@@ -141,14 +191,14 @@ public class MqttService : IDisposable
 
     public async Task HandleSessionEndingAsync()
     {
-        Log.Warning("Получено уведомление SessionEnding. Публикуем OFF и отключаемся от MQTT перед завершением сеанса.");
+        Log.Warning("Получено уведомление SessionEnding. Публикуем OFF и отключаемся.");
         await PublishOffAndDisconnectAsync().ConfigureAwait(false);
     }
 
     private async Task PublishOffAndDisconnectAsync()
     {
         _isStopping = true;
-        _publishTimer?.Dispose();
+        _publishTimer?.Change(Timeout.Infinite, Timeout.Infinite);
 
         if (!_isConnected) return;
 
@@ -160,38 +210,30 @@ public class MqttService : IDisposable
         }
         catch (TimeoutException)
         {
-            Log.Warning($"Публикация OFF в топик {PowerTopic} не завершилась за {MqttPowerChangeTimeout.TotalSeconds} сек. Отказываемся от DISCONNECT и рассчитываем на LWT.");
+            Log.Warning($"Публикация OFF не завершилась за {MqttPowerChangeTimeout.TotalSeconds} сек. Рассчитываем на LWT.");
         }
         catch (Exception ex)
         {
             Log.Error(ex, $"Не удалось опубликовать OFF в {PowerTopic}.");
         }
 
-        if (!publishSucceeded)
-        {
-            Log.Warning("DISCONNECT не отправлен: брокер получит LWT при нештатном разрыве TCP-соединения.");
-            return;
-        }
+        if (!publishSucceeded) return;
 
         try
         {
             await _mqttClient.DisconnectAsync().WaitAsync(MqttPowerChangeTimeout).ConfigureAwait(false);
         }
-        catch (TimeoutException)
-        {
-            Log.Warning($"Отключение от MQTT брокера не завершилось за {MqttPowerChangeTimeout.TotalSeconds} сек.");
-        }
         catch (Exception ex)
         {
-            Log.Warning(ex, $"Не удалось штатно отключиться от MQTT.");
+            Log.Warning(ex, "Не удалось штатно отключиться от MQTT.");
         }
     }
 
-    private bool ExecuteSystemCommand(string arguments)
+    private void ExecuteSystemCommand(string arguments)
     {
         try
         {
-            Log.Information($"Выполнение: shutdown.exe {arguments}");
+            Log.Information($"Выполнение: C:\\Windows\\System32\\shutdown.exe {arguments}");
             var startInfo = new ProcessStartInfo
             {
                 FileName = "shutdown",
@@ -200,21 +242,20 @@ public class MqttService : IDisposable
                 CreateNoWindow = true,
                 WindowStyle = ProcessWindowStyle.Hidden
             };
+            
             using var process = Process.Start(startInfo);
-
             if (process == null)
             {
-                Log.Error("Не удалось запустить shutdown.exe: Process.Start вернул null. Приложение остаётся онлайн.");
-                return false;
+                Log.Error("Не удалось запустить shutdown.exe: Process.Start вернул null.");
             }
-
-            Log.Information("Команда shutdown.exe успешно передана ОС. Ожидаем SessionEnding для публикации OFF и отключения от брокера.");
-            return true;
+            else
+            {
+                Log.Information("Команда shutdown.exe успешно передана ОС.");
+            }
         }
         catch (Exception ex)
         {
-            Log.Error(ex, "КРИТИЧЕСКАЯ ОШИБКА: Не удалось запустить shutdown.exe. Приложение остаётся онлайн.");
-            return false;
+            Log.Error(ex, "КРИТИЧЕСКАЯ ОШИБКА: Не удалось запустить shutdown.exe.");
         }
     }
 
@@ -222,6 +263,19 @@ public class MqttService : IDisposable
     {
         if (!_isConnected) return;
         await PublishSingleAsync(PowerTopic, state, true).ConfigureAwait(false);
+    }
+
+    // УЛУЧШЕНИЕ 3: Методы для Ack и Canceled
+    private async Task PublishAckAsync(string command)
+    {
+        if (!_isConnected) return;
+        await PublishSingleAsync(AckTopic, $"received: {command}", false).ConfigureAwait(false);
+    }
+
+    private async Task PublishCanceledAsync(string command)
+    {
+        if (!_isConnected) return;
+        await PublishSingleAsync(AckTopic, $"canceled: {command}", false).ConfigureAwait(false);
     }
 
     private async Task PublishPeriodicDataAsync()
@@ -232,13 +286,12 @@ public class MqttService : IDisposable
         {
             App.HardwareMonitor.Update();
 
-            // Публикация версии и uptime (всегда)
             var version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0";
             var uptime = TimeSpan.FromMilliseconds(Environment.TickCount64).ToString(@"dd\.hh\:mm\:ss");
-            await PublishSingleAsync($"{_settings.Mqtt.BaseTopic}/info/version", version, true);
-            await PublishSingleAsync($"{_settings.Mqtt.BaseTopic}/info/uptime", uptime, true);
+            
+            await PublishSingleAsync($"{_settings.Mqtt.BaseTopic}/info/version", version, true).ConfigureAwait(false);
+            await PublishSingleAsync($"{_settings.Mqtt.BaseTopic}/info/uptime", uptime, true).ConfigureAwait(false);
 
-            // Динамическая публикация только ВКЛЮЧЕННЫХ датчиков из конфига
             foreach (var sensorConfig in App.Settings.Sensors.Where(s => s.Enabled))
             {
                 var value = App.HardwareMonitor.GetValue(sensorConfig);
@@ -246,11 +299,9 @@ public class MqttService : IDisposable
                 {
                     string formattedValue = FormatValue(value.Value, sensorConfig.SensorType);
                     string topic = $"{_settings.Mqtt.BaseTopic}/info/{sensorConfig.TopicSuffix}";
-                    await PublishSingleAsync(topic, formattedValue, true);
+                    await PublishSingleAsync(topic, formattedValue, true).ConfigureAwait(false);
                 }
             }
-            
-            Log.Information("Периодические данные успешно опубликованы.");
         }
         catch (Exception ex)
         {
@@ -260,10 +311,9 @@ public class MqttService : IDisposable
 
     private string FormatValue(float value, string sensorType)
     {
-        // Автоматическое добавление единиц измерения для удобства
-        if (sensorType.Equals("Temperature", StringComparison.OrdinalIgnoreCase)) return $"{value}°C";
-        if (sensorType.Equals("Load", StringComparison.OrdinalIgnoreCase)) return $"{value}%";
-        if (sensorType.Equals("Data", StringComparison.OrdinalIgnoreCase)) return $"{value} MB"; // Или GB, зависит от датчика
+        if (sensorType.Equals("Temperature", StringComparison.OrdinalIgnoreCase)) return $"{value}";
+        if (sensorType.Equals("Load", StringComparison.OrdinalIgnoreCase)) return $"{value}";
+        if (sensorType.Equals("Data", StringComparison.OrdinalIgnoreCase)) return $"{value}";
         return value.ToString();
     }
 
@@ -281,12 +331,13 @@ public class MqttService : IDisposable
 
     public async Task StopAsync()
     {
-        Log.Information("Завершение работы MQTT сервиса из события on_exit...");
-        await PrepareForPowerStateChangeAsync();
+        Log.Information("Завершение работы MQTT сервиса (штатный выход)...");
+        await PrepareForPowerStateChangeAsync().ConfigureAwait(false);
     }
 
     public void Dispose()
     {
         _mqttClient?.Dispose();
+        _publishTimer?.Dispose();
     }
 }
