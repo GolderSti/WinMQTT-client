@@ -109,7 +109,7 @@ public class MqttService : IDisposable
             if (payload.Equals("OFF", StringComparison.OrdinalIgnoreCase))
             {
                 Log.Warning("Получена команда ВЫКЛЮЧЕНИЯ ПК через топик управления питанием.");
-                RequestSystemShutdown();
+                ExecuteSystemCommand("/s /f /t 0");
             }
             return;
         }
@@ -120,12 +120,11 @@ public class MqttService : IDisposable
             {
                 case "shutdown":
                     Log.Warning("Получена команда ВЫКЛЮЧЕНИЯ ПК.");
-                    RequestSystemShutdown();
+                    ExecuteSystemCommand("/s /f /t 0");
                     break;
                 case "reboot":
                 case "restart":
                     Log.Warning("Получена команда ПЕРЕЗАГРУЗКИ ПК.");
-                    await PrepareForPowerStateChangeAsync();
                     ExecuteSystemCommand("/r /f /t 0");
                     break;
                 default:
@@ -137,16 +136,16 @@ public class MqttService : IDisposable
 
     private async Task PrepareForPowerStateChangeAsync()
     {
-        await PublishOffAndDisconnectAsync(disconnectOnPublishFailure: true, "изменением состояния питания").ConfigureAwait(false);
+        await PublishOffAndDisconnectAsync().ConfigureAwait(false);
     }
 
     public async Task HandleSessionEndingAsync()
     {
         Log.Warning("Получено уведомление SessionEnding. Публикуем OFF и отключаемся от MQTT перед завершением сеанса.");
-        await PublishOffAndDisconnectAsync(disconnectOnPublishFailure: false, "завершением сеанса Windows").ConfigureAwait(false);
+        await PublishOffAndDisconnectAsync().ConfigureAwait(false);
     }
 
-    private async Task PublishOffAndDisconnectAsync(bool disconnectOnPublishFailure, string reason)
+    private async Task PublishOffAndDisconnectAsync()
     {
         _isStopping = true;
         _publishTimer?.Dispose();
@@ -161,21 +160,14 @@ public class MqttService : IDisposable
         }
         catch (TimeoutException)
         {
-            if (disconnectOnPublishFailure)
-            {
-                Log.Warning($"Публикация OFF в топик {PowerTopic} не завершилась за {MqttPowerChangeTimeout.TotalSeconds} сек. Продолжаем {reason}.");
-            }
-            else
-            {
-                Log.Warning($"Публикация OFF в топик {PowerTopic} не завершилась за {MqttPowerChangeTimeout.TotalSeconds} сек. Отказываемся от DISCONNECT и рассчитываем на LWT.");
-            }
+            Log.Warning($"Публикация OFF в топик {PowerTopic} не завершилась за {MqttPowerChangeTimeout.TotalSeconds} сек. Отказываемся от DISCONNECT и рассчитываем на LWT.");
         }
         catch (Exception ex)
         {
-            Log.Error(ex, $"Не удалось опубликовать OFF в {PowerTopic} перед {reason}.");
+            Log.Error(ex, $"Не удалось опубликовать OFF в {PowerTopic}.");
         }
 
-        if (!publishSucceeded && !disconnectOnPublishFailure)
+        if (!publishSucceeded)
         {
             Log.Warning("DISCONNECT не отправлен: брокер получит LWT при нештатном разрыве TCP-соединения.");
             return;
@@ -187,17 +179,12 @@ public class MqttService : IDisposable
         }
         catch (TimeoutException)
         {
-            Log.Warning($"Отключение от MQTT брокера не завершилось за {MqttPowerChangeTimeout.TotalSeconds} сек. Продолжаем {reason}.");
+            Log.Warning($"Отключение от MQTT брокера не завершилось за {MqttPowerChangeTimeout.TotalSeconds} сек.");
         }
         catch (Exception ex)
         {
-            Log.Warning(ex, $"Не удалось штатно отключиться от MQTT перед {reason}.");
+            Log.Warning(ex, $"Не удалось штатно отключиться от MQTT.");
         }
-    }
-
-    private bool RequestSystemShutdown()
-    {
-        return ExecuteSystemCommand("/s /t 0");
     }
 
     private bool ExecuteSystemCommand(string arguments)
@@ -207,7 +194,7 @@ public class MqttService : IDisposable
             Log.Information($"Выполнение: shutdown.exe {arguments}");
             var startInfo = new ProcessStartInfo
             {
-                FileName = "shutdown.exe",
+                FileName = "shutdown",
                 Arguments = arguments,
                 UseShellExecute = false,
                 CreateNoWindow = true,
@@ -294,7 +281,7 @@ public class MqttService : IDisposable
 
     public async Task StopAsync()
     {
-        Log.Information("Завершение работы MQTT сервиса...");
+        Log.Information("Завершение работы MQTT сервиса из события on_exit...");
         await PrepareForPowerStateChangeAsync();
     }
 
