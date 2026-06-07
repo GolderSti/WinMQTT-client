@@ -108,6 +108,7 @@ public class MqttService : IDisposable
         if (topic.Equals(PowerSetTopic, StringComparison.OrdinalIgnoreCase))
         {
             if (payload.Equals("OFF", StringComparison.OrdinalIgnoreCase))
+//If a retained OFF message ever exists on /POWER/SET (for example from mosquitto_pub -r or a retained automation command), the broker will deliver it immediately after every subscribe/reconnect and this handler will shut the machine down without a fresh command. Command topics should reject retained deliveries or clear the retained command after processing so a stale control message cannot repeat on every agent start.
             {
                 Log.Warning("Получена команда ВЫКЛЮЧЕНИЯ ПК через топик управления питанием.");
                 await PrepareForPowerStateChangeAsync();
