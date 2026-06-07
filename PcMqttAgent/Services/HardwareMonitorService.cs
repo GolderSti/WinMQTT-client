@@ -1,5 +1,8 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using LibreHardwareMonitor.Hardware;
+using PcMqttAgent.Models;
 using Serilog;
 
 namespace PcMqttAgent.Services;
@@ -17,13 +20,14 @@ public class HardwareMonitorService : IDisposable
             IsCpuEnabled = true,
             IsGpuEnabled = true,
             IsMemoryEnabled = true,
-            IsMotherboardEnabled = false // Отключаем, чтобы не засорять лог лишними данными платы
+            IsMotherboardEnabled = true // Включаем для максимально полного сканирования
         };
         
         _computer.Open();
+        // Сразу обновляем, чтобы получить актуальные значения и список датчиков
         _computer.Accept(_updateVisitor);
         
-        Log.Information("Hardware Monitor инициализирован.");
+        Log.Information("Hardware Monitor инициализирован и просканирован.");
     }
 
     public void Update()
@@ -31,55 +35,41 @@ public class HardwareMonitorService : IDisposable
         _computer.Accept(_updateVisitor);
     }
 
-    public float? GetCpuLoad() => GetSensorValue(HardwareType.Cpu, SensorType.Load, "CPU Total");
-    
-    public float? GetCpuTemperature() 
+    // Метод для получения значения конкретного датчика по конфигу
+    public float? GetValue(SensorConfig config)
     {
-        // Ищем именно так, как датчик называется в вашем логе
-        return GetSensorValue(HardwareType.Cpu, SensorType.Temperature, "Core (Tctl/Tdie)");
-    }
-    
-    public float? GetGpuTemperature() 
-    {
-        // Для встроенной AMD Radeon Graphics датчика температуры обычно не существует.
-        // Оставляем поиск на всякий случай, но ожидаемо получим null.
-        float? temp = GetSensorValue(HardwareType.GpuAmd, SensorType.Temperature, "GPU Core");
-        if (temp == null)
-        {
-            temp = GetSensorValue(HardwareType.GpuNvidia, SensorType.Temperature, "GPU Core");
-        }
-        return temp;
-    }
-    
-    public float? GetRamLoad() 
-    {
-        // В логе есть "Total Memory" и "Virtual Memory". Берем общую загрузку памяти.
-        return GetSensorValue(HardwareType.Memory, SensorType.Load, "Total Memory") 
-               ?? GetSensorValue(HardwareType.Memory, SensorType.Load);
-    }
+        if (!Enum.TryParse<HardwareType>(config.HardwareType, true, out var hwType)) return null;
+        if (!Enum.TryParse<SensorType>(config.SensorType, true, out var sType)) return null;
 
-    private float? GetSensorValue(HardwareType hardwareType, SensorType sensorType, string? nameContains = null)
-    {
         foreach (var hardware in _computer.Hardware)
         {
-            if (hardware.HardwareType == hardwareType)
+            if (hardware.HardwareType == hwType)
             {
                 foreach (var sensor in hardware.Sensors)
                 {
-                    if (sensor.SensorType == sensorType)
+                    if (sensor.SensorType == sType && 
+                        sensor.Name.Equals(config.SensorName, StringComparison.OrdinalIgnoreCase))
                     {
-                        if (string.IsNullOrEmpty(nameContains) || sensor.Name.Contains(nameContains, StringComparison.OrdinalIgnoreCase))
-                        {
-                            if (sensor.Value.HasValue)
-                            {
-                                return (float)Math.Round(sensor.Value.Value, 1);
-                            }
-                        }
+                        return sensor.Value.HasValue ? (float)Math.Round(sensor.Value.Value, 1) : null;
                     }
                 }
             }
         }
         return null;
+    }
+
+    // Метод для получения ВСЕХ доступных датчиков (для обновления конфига)
+    public IEnumerable<(string HardwareType, string SensorType, string SensorName)> GetAllAvailableSensors()
+    {
+        var result = new List<(string, string, string)>();
+        foreach (var hardware in _computer.Hardware)
+        {
+            foreach (var sensor in hardware.Sensors)
+            {
+                result.Add((hardware.HardwareType.ToString(), sensor.SensorType.ToString(), sensor.Name));
+            }
+        }
+        return result;
     }
 
     public void Dispose()

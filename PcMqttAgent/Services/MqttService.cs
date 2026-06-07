@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -16,8 +17,6 @@ public class MqttService : IDisposable
     private readonly AppSettings _settings;
     private readonly IMqttClient _mqttClient;
     private static readonly TimeSpan MqttPowerChangeTimeout = TimeSpan.FromSeconds(2);
-
-    private readonly HardwareMonitorService _hardwareMonitor;
     private Timer? _publishTimer;
     private bool _isConnected;
     private bool _isStopping;
@@ -30,7 +29,6 @@ public class MqttService : IDisposable
         _settings = settings;
         var factory = new MqttFactory();
         _mqttClient = factory.CreateMqttClient();
-        _hardwareMonitor = new HardwareMonitorService();
 
         _mqttClient.ConnectedAsync += OnConnectedAsync;
         _mqttClient.DisconnectedAsync += OnDisconnectedAsync;
@@ -87,7 +85,7 @@ public class MqttService : IDisposable
             return;
         }
 
-        Log.Warning("Соединение с MQTT брокером разорвано. Переподключение через 5 сек...");
+        Log.Warning("Соединение разорвано. Переподключение через 5 сек...");
         await Task.Delay(5000);
         try
         {
@@ -101,24 +99,19 @@ public class MqttService : IDisposable
 
     private async Task OnMessageReceivedAsync(MqttApplicationMessageReceivedEventArgs e)
     {
+        var payload = Encoding.UTF8.GetString(e.ApplicationMessage.PayloadSegment)
+                                   .Replace("\n", "").Replace("\r", "").Trim();
         var topic = e.ApplicationMessage.Topic;
-        var payload = Encoding.UTF8.GetString(e.ApplicationMessage.PayloadSegment).Trim();
-        Log.Information($"Получена команда по топику {topic}: {payload}");
+        Log.Information($"Получена команда по топику {topic}: '{payload}'");
 
         if (topic.Equals(PowerSetTopic, StringComparison.OrdinalIgnoreCase))
         {
             if (payload.Equals("OFF", StringComparison.OrdinalIgnoreCase))
-//If a retained OFF message ever exists on /POWER/SET (for example from mosquitto_pub -r or a retained automation command), the broker will deliver it immediately after every subscribe/reconnect and this handler will shut the machine down without a fresh command. Command topics should reject retained deliveries or clear the retained command after processing so a stale control message cannot repeat on every agent start.
             {
                 Log.Warning("Получена команда ВЫКЛЮЧЕНИЯ ПК через топик управления питанием.");
                 await PrepareForPowerStateChangeAsync();
-                ExecuteSystemCommand("/s /t 0");
+                ExecuteSystemCommand("/s /f /t 0"); // /f принудительно закрывает приложения
             }
-            else
-            {
-                Log.Warning($"Неизвестная команда управления питанием: {payload}");
-            }
-
             return;
         }
 
@@ -129,33 +122,27 @@ public class MqttService : IDisposable
                 case "shutdown":
                     Log.Warning("Получена команда ВЫКЛЮЧЕНИЯ ПК.");
                     await PrepareForPowerStateChangeAsync();
-                    ExecuteSystemCommand("/s /t 0");
+                    ExecuteSystemCommand("/s /f /t 0");
                     break;
                 case "reboot":
                 case "restart":
                     Log.Warning("Получена команда ПЕРЕЗАГРУЗКИ ПК.");
                     await PrepareForPowerStateChangeAsync();
-                    ExecuteSystemCommand("/r /t 0");
+                    ExecuteSystemCommand("/r /f /t 0");
                     break;
                 default:
-                    Log.Warning($"Неизвестная команда: {payload}");
+                    Log.Warning($"Неизвестная команда: '{payload}'");
                     break;
             }
         }
-        
-        return;
     }
-    
 
     private async Task PrepareForPowerStateChangeAsync()
     {
         _isStopping = true;
         _publishTimer?.Dispose();
 
-        if (!_isConnected)
-        {
-            return;
-        }
+        if (!_isConnected) return;
 
         try
         {
@@ -167,7 +154,7 @@ public class MqttService : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Error(ex, $"Не удалось опубликовать OFF в топик {PowerTopic} перед изменением состояния питания.");
+            Log.Error(ex, $"Не удалось опубликовать OFF в {PowerTopic} перед изменением состояния питания.");
         }
 
         try
@@ -180,7 +167,7 @@ public class MqttService : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Error(ex, "Не удалось штатно отключиться от MQTT брокера перед изменением состояния питания.");
+            Log.Warning(ex, "Не удалось штатно отключиться от MQTT, продолжаем выключение.");
         }
     }
 
@@ -188,18 +175,21 @@ public class MqttService : IDisposable
     {
         try
         {
+            Log.Information($"Выполнение: shutdown.exe {arguments}");
             var startInfo = new ProcessStartInfo
             {
                 FileName = "shutdown",
                 Arguments = arguments,
                 UseShellExecute = false,
-                CreateNoWindow = true
+                CreateNoWindow = true,
+                WindowStyle = ProcessWindowStyle.Hidden
             };
             Process.Start(startInfo);
+            Log.Information("Команда shutdown.exe успешно передана ОС.");
         }
         catch (Exception ex)
         {
-            Log.Error(ex, "Не удалось выполнить системную команду. Возможно, недостаточно прав.");
+            Log.Error(ex, "КРИТИЧЕСКАЯ ОШИБКА: Не удалось запустить shutdown.exe.");
         }
     }
 
@@ -211,34 +201,45 @@ public class MqttService : IDisposable
 
     private async Task PublishPeriodicDataAsync()
     {
-        if (!_isConnected) return;
+        if (!_isConnected || App.HardwareMonitor == null) return;
 
         try
         {
-            _hardwareMonitor.Update();
+            App.HardwareMonitor.Update();
 
+            // Публикация версии и uptime (всегда)
             var version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0";
             var uptime = TimeSpan.FromMilliseconds(Environment.TickCount64).ToString(@"dd\.hh\:mm\:ss");
-            
-            var cpuLoad = _hardwareMonitor.GetCpuLoad();
-            var ramLoad = _hardwareMonitor.GetRamLoad();
-            var cpuTemp = _hardwareMonitor.GetCpuTemperature();
-            var gpuTemp = _hardwareMonitor.GetGpuTemperature();
-
             await PublishSingleAsync($"{_settings.Mqtt.BaseTopic}/info/version", version, true);
             await PublishSingleAsync($"{_settings.Mqtt.BaseTopic}/info/uptime", uptime, true);
-            
-            if (cpuLoad.HasValue) await PublishSingleAsync($"{_settings.Mqtt.BaseTopic}/info/cpu", $"{cpuLoad}%", true);
-            if (ramLoad.HasValue) await PublishSingleAsync($"{_settings.Mqtt.BaseTopic}/info/ram", $"{ramLoad}%", true);
-            if (cpuTemp.HasValue) await PublishSingleAsync($"{_settings.Mqtt.BaseTopic}/info/temp/cpu", $"{cpuTemp}°C", true);
-            if (gpuTemp.HasValue) await PublishSingleAsync($"{_settings.Mqtt.BaseTopic}/info/temp/gpu", $"{gpuTemp}°C", true);
 
-            Log.Information($"Статус: CPU={cpuLoad?.ToString() ?? "N/A"}%, RAM={ramLoad?.ToString() ?? "N/A"}%, CPU_T={cpuTemp?.ToString() ?? "N/A"}°C, GPU_T={gpuTemp?.ToString() ?? "N/A"}°C");
+            // Динамическая публикация только ВКЛЮЧЕННЫХ датчиков из конфига
+            foreach (var sensorConfig in App.Settings.Sensors.Where(s => s.Enabled))
+            {
+                var value = App.HardwareMonitor.GetValue(sensorConfig);
+                if (value.HasValue)
+                {
+                    string formattedValue = FormatValue(value.Value, sensorConfig.SensorType);
+                    string topic = $"{_settings.Mqtt.BaseTopic}/info/{sensorConfig.TopicSuffix}";
+                    await PublishSingleAsync(topic, formattedValue, true);
+                }
+            }
+            
+            Log.Information("Периодические данные успешно опубликованы.");
         }
         catch (Exception ex)
         {
             Log.Error(ex, "Ошибка при публикации периодических данных.");
         }
+    }
+
+    private string FormatValue(float value, string sensorType)
+    {
+        // Автоматическое добавление единиц измерения для удобства
+        if (sensorType.Equals("Temperature", StringComparison.OrdinalIgnoreCase)) return $"{value}°C";
+        if (sensorType.Equals("Load", StringComparison.OrdinalIgnoreCase)) return $"{value}%";
+        if (sensorType.Equals("Data", StringComparison.OrdinalIgnoreCase)) return $"{value} MB"; // Или GB, зависит от датчика
+        return value.ToString();
     }
 
     private async Task PublishSingleAsync(string topic, string payload, bool retain = true)
@@ -257,7 +258,6 @@ public class MqttService : IDisposable
     {
         Log.Information("Завершение работы MQTT сервиса...");
         await PrepareForPowerStateChangeAsync();
-        _hardwareMonitor.Dispose();
     }
 
     public void Dispose()
