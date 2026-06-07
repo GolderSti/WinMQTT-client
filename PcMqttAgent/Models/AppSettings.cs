@@ -11,9 +11,6 @@ public class AppSettings
     // Новый список конфигурации датчиков
     public List<SensorConfig> Sensors { get; set; } = new()
     {
-        // Примеры по умолчанию (будут проверены и дополнены при первом запуске)
-        new SensorConfig { HardwareType = "Cpu", SensorType = "Load", SensorName = "CPU Total", TopicSuffix = "cpu_load", Enabled = true },
-        new SensorConfig { HardwareType = "Memory", SensorType = "Load", SensorName = "Memory", TopicSuffix = "ram_load", Enabled = true },
     };
 }
 
