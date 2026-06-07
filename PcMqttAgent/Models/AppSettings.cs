@@ -14,8 +14,6 @@ public class AppSettings
         // Примеры по умолчанию (будут проверены и дополнены при первом запуске)
         new SensorConfig { HardwareType = "Cpu", SensorType = "Load", SensorName = "CPU Total", TopicSuffix = "cpu_load", Enabled = true },
         new SensorConfig { HardwareType = "Memory", SensorType = "Load", SensorName = "Memory", TopicSuffix = "ram_load", Enabled = true },
-        new SensorConfig { HardwareType = "Cpu", SensorType = "Temperature", SensorName = "Core (Tctl/Tdie)", TopicSuffix = "temp/cpu", Enabled = true },
-        new SensorConfig { HardwareType = "GpuAmd", SensorType = "Temperature", SensorName = "GPU Core", TopicSuffix = "temp/gpu", Enabled = true }
     };
 }
 
