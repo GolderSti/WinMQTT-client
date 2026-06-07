@@ -7,6 +7,7 @@ public class AppSettings
     public MqttSettings Mqtt { get; set; } = new();
     public PublisherSettings Publisher { get; set; } = new();
     public LoggingSettings Logging { get; set; } = new();
+    public int ShutdownWarningSeconds { get; set; } = 15; // Время на раздумья перед выключением
     
     // Новый список конфигурации датчиков
     public List<SensorConfig> Sensors { get; set; } = new()
