@@ -23,6 +23,8 @@
   <ItemGroup>
     <None Remove="app.ico" />
     <Resource Include="app.ico" />
+    <Resource Include="icon_connected.ico" />
+    <Resource Include="icon_disconnected.ico" />
   </ItemGroup>
 
   <!-- ЭТОТ БЛОК ГАРАНТИРУЕТ КОПИРОВАНИЕ ФАЙЛА НАСТРОЕК ПРИ СБОРКЕ -->

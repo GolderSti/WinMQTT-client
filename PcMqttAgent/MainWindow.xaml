@@ -3,18 +3,17 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:tb="http://www.hardcodet.net/taskbar"
         Title="PcMqttAgent" 
-        Icon="/app.ico"
         Height="0" Width="0" 
         ShowInTaskbar="False" 
         Visibility="Hidden"
         WindowState="Minimized">
     
     <Grid>
-        <!-- Иконка в трее -->
         <tb:TaskbarIcon 
-            ToolTipText="PcMqtt Agent (Работает)"
-            IconSource="/app.ico"
+            x:Name="TrayIcon"
             LeftClickCommand="{Binding ShowSettingsCommand}" 
+            IconSource="/icon_disconnected.ico" 
+            ToolTipText="PcMqtt Agent (Отключено)"
             MenuActivation="RightClick">
             
             <tb:TaskbarIcon.ContextMenu>

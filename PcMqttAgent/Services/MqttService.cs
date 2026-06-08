@@ -4,7 +4,7 @@ using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Windows; // Добавлено для доступа к Application.Current.Dispatcher
+using System.Windows;
 using MQTTnet;
 using MQTTnet.Client;
 using MQTTnet.Protocol;
@@ -18,9 +18,21 @@ public class MqttService : IDisposable
     private readonly AppSettings _settings;
     private readonly IMqttClient _mqttClient;
     private static readonly TimeSpan MqttPowerChangeTimeout = TimeSpan.FromSeconds(2);
+    private readonly CancellationTokenSource _cts = new();
+    
+    // Настройки экспоненциальной задержки (в миллисекундах)
+    private const int BaseDelayMs = 2000;      // Начальная задержка 2 сек
+    private const int MaxDelayMs = 60000;      // Максимальная задержка 60 сек
+    private const int JitterMs = 2000;         // Случайная добавка от 0 до 2 сек
+    private int _reconnectAttempts = 0;
+    private readonly Random _random = new();
+
     private Timer? _publishTimer;
     private bool _isConnected;
     private bool _isStopping;
+
+    // Событие для уведомления UI об изменении статуса подключения
+    public event Action<bool>? ConnectionStateChanged;
 
     private string PowerTopic => $"/{_settings.Mqtt.BaseTopic.Trim('/')}/POWER";
     private string PowerSetTopic => $"/{_settings.Mqtt.BaseTopic.Trim('/')}/POWER/SET";
@@ -52,24 +64,21 @@ public class MqttService : IDisposable
             .WithWillRetain(true)
             .Build();
 
-        await _mqttClient.ConnectAsync(options, CancellationToken.None);
+        await _mqttClient.ConnectAsync(options, _cts.Token);
     }
 
     private async Task OnConnectedAsync(MqttClientConnectedEventArgs e)
     {
         _isConnected = true;
+        _reconnectAttempts = 0; // Сбрасываем счетчик при успешном подключении
         Log.Information("Успешно подключено к MQTT брокеру.");
         
+        NotifyConnectionStateChanged(true);
         await PublishPowerStateAsync("ON").ConfigureAwait(false);
+        await ClearRetainedCommandsAsync().ConfigureAwait(false);
 
         await _mqttClient.SubscribeAsync(new MqttTopicFilterBuilder().WithTopic(CommandTopic).Build()).ConfigureAwait(false);
-        Log.Information($"Подписка на топик команд: {CommandTopic}");
-
         await _mqttClient.SubscribeAsync(new MqttTopicFilterBuilder().WithTopic(PowerSetTopic).Build()).ConfigureAwait(false);
-        Log.Information($"Подписка на топик управления питанием: {PowerSetTopic}");
-
-        // УЛУЧШЕНИЕ 1: Очищаем retain-команды с брокера сразу после подписки
-        await ClearRetainedCommandsAsync().ConfigureAwait(false);
 
         if (_publishTimer == null)
         {
@@ -86,35 +95,52 @@ public class MqttService : IDisposable
         }
     }
 
-    // УЛУЧШЕНИЕ 1: Публикация пустого сообщения с retain=true удаляет старое retain-сообщение с брокера
-    private async Task ClearRetainedCommandsAsync()
-    {
-        await PublishSingleAsync(CommandTopic, "", true).ConfigureAwait(false);
-        await PublishSingleAsync(PowerSetTopic, "", true).ConfigureAwait(false);
-        Log.Information("Retain-команды на брокере очищены.");
-    }
-
     private async Task OnDisconnectedAsync(MqttClientDisconnectedEventArgs e)
     {
         _isConnected = false;
+        NotifyConnectionStateChanged(false);
         _publishTimer?.Change(Timeout.Infinite, Timeout.Infinite);
 
-        if (_isStopping)
+        if (_isStopping || _cts.IsCancellationRequested)
         {
             Log.Information("MQTT сервис отключен штатно.");
             return;
         }
 
-        Log.Warning("Соединение разорвано. Переподключение через 5 сек...");
-        await Task.Delay(5000).ConfigureAwait(false);
+        // Экспоненциальная задержка со случайной компонентой (Jitter)
+        _reconnectAttempts++;
+        int delayMs = (int)Math.Min(MaxDelayMs, BaseDelayMs * Math.Pow(2, _reconnectAttempts - 1));
+        int jitter = _random.Next(0, JitterMs);
+        int totalDelayMs = delayMs + jitter;
+
+        Log.Warning($"Соединение разорвано. Переподключение через {totalDelayMs / 1000.0:F1} сек. (Попытка #{_reconnectAttempts})");
+
         try
         {
-            await _mqttClient.ConnectAsync(_mqttClient.Options, CancellationToken.None).ConfigureAwait(false);
+            await Task.Delay(totalDelayMs, _cts.Token);
+            await _mqttClient.ConnectAsync(_mqttClient.Options, _cts.Token).ConfigureAwait(false);
+        }
+        catch (TaskCanceledException)
+        {
+            Log.Information("Переподключение отменено (закрытие приложения).");
         }
         catch (Exception ex)
         {
             Log.Error(ex, "Ошибка переподключения к MQTT.");
         }
+    }
+
+    private void NotifyConnectionStateChanged(bool isConnected)
+    {
+        // Безопасный вызов события из любого потока
+        ConnectionStateChanged?.Invoke(isConnected);
+    }
+
+    private async Task ClearRetainedCommandsAsync()
+    {
+        await PublishSingleAsync(CommandTopic, "", true).ConfigureAwait(false);
+        await PublishSingleAsync(PowerSetTopic, "", true).ConfigureAwait(false);
+        Log.Information("Retain-команды на брокере очищены.");
     }
 
     private async Task OnMessageReceivedAsync(MqttApplicationMessageReceivedEventArgs e)
@@ -123,12 +149,9 @@ public class MqttService : IDisposable
                                     .Replace("\n", "").Replace("\r", "").Trim();
         var topic = e.ApplicationMessage.Topic;
 
-        // ИГНОРИРУЕМ пустые сообщения (это наша же очистка retain или мусор)
         if (string.IsNullOrWhiteSpace(payload)) return;
 
         Log.Information($"Получена команда по топику {topic}: '{payload}'");
-
-        // УЛУЧШЕНИЕ 3: Отправляем подтверждение получения команды
         await PublishAckAsync(payload).ConfigureAwait(false);
 
         if (topic.Equals(PowerSetTopic, StringComparison.OrdinalIgnoreCase))
@@ -158,12 +181,10 @@ public class MqttService : IDisposable
         }
     }
 
-    // УЛУЧШЕНИЕ 2: Асинхронный вызов UI-диалога через Dispatcher
     private async Task ProcessPowerCommandAsync(string actionName, string shutdownArgs)
     {
         Log.Warning($"Инициализация процесса {actionName.ToUpper()} с предупреждением пользователя.");
 
-        // Вызываем WPF окно в главном UI-потоке
         bool? userConfirmed = await Application.Current.Dispatcher.InvokeAsync(() =>
         {
             var dialog = new ShutdownWarningWindow(actionName);
@@ -172,14 +193,13 @@ public class MqttService : IDisposable
 
         if (userConfirmed == true)
         {
-            Log.Information("Пользователь подтвердил действие (или истек таймер). Выполнение...");
-            // await PrepareForPowerStateChangeAsync().ConfigureAwait(false);
+            Log.Information("Пользователь подтвердил действие. Выполнение...");
+            //await PrepareForPowerStateChangeAsync().ConfigureAwait(false);
             ExecuteSystemCommand(shutdownArgs);
         }
         else
         {
             Log.Information("Пользователь отменил действие.");
-            // УЛУЧШЕНИЕ 3: Отправляем сообщение об отмене
             await PublishCanceledAsync(actionName).ConfigureAwait(false);
         }
     }
@@ -236,13 +256,12 @@ public class MqttService : IDisposable
             Log.Information($"Выполнение: C:\\Windows\\System32\\shutdown.exe {arguments}");
             var startInfo = new ProcessStartInfo
             {
-                FileName = "shutdown",
+                FileName = "C:\\Windows\\System32\\shutdown.exe",
                 Arguments = arguments,
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 WindowStyle = ProcessWindowStyle.Hidden
             };
-            
             using var process = Process.Start(startInfo);
             if (process == null)
             {
@@ -265,7 +284,6 @@ public class MqttService : IDisposable
         await PublishSingleAsync(PowerTopic, state, true).ConfigureAwait(false);
     }
 
-    // УЛУЧШЕНИЕ 3: Методы для Ack и Canceled
     private async Task PublishAckAsync(string command)
     {
         if (!_isConnected) return;
@@ -285,7 +303,6 @@ public class MqttService : IDisposable
         try
         {
             App.HardwareMonitor.Update();
-
             var version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0";
             var uptime = TimeSpan.FromMilliseconds(Environment.TickCount64).ToString(@"dd\.hh\:mm\:ss");
             
@@ -337,6 +354,8 @@ public class MqttService : IDisposable
 
     public void Dispose()
     {
+        _cts.Cancel(); // Прерываем любые ожидающие Task.Delay
+        _cts.Dispose();
         _mqttClient?.Dispose();
         _publishTimer?.Dispose();
     }
