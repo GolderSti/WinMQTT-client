@@ -23,11 +23,19 @@
   <ItemGroup>
     <None Remove="app.ico" />
     <Resource Include="app.ico" />
+    <Resource Include="icon_connected.ico" />
+    <Resource Include="icon_disconnected.ico" />
   </ItemGroup>
 
   <!-- ЭТОТ БЛОК ГАРАНТИРУЕТ КОПИРОВАНИЕ ФАЙЛА НАСТРОЕК ПРИ СБОРКЕ -->
   <ItemGroup>
     <None Update="appsettings.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="icon_connected.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="icon_disconnected.ico">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
   </ItemGroup>
