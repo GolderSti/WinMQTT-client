@@ -1,5 +1,7 @@
 ﻿using System;
+using System.IO;
 using System.Windows;
+using Serilog;
 
 namespace PcMqttAgent;
 
@@ -9,32 +11,39 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         
-        // Подписываемся на изменение статуса подключения
         if (App.MqttService != null)
         {
             App.MqttService.ConnectionStateChanged += OnConnectionStateChanged;
-            // Инициализируем начальное состояние (если уже подключено к моменту создания окна)
-            // Но так как подключение асинхронное, лучше положиться на событие
         }
     }
 
     private void OnConnectionStateChanged(bool isConnected)
     {
-        // ВАЖНО: Событие приходит из фонового потока MQTTnet. 
-        // Обновление UI должно происходить в главном потоке через Dispatcher.
-        Application.Current.Dispatcher.InvokeAsync(() =>
+        // Обновляем UI строго в главном потоке
+        Log.Information("Обновляем иконки в трее.");
+        Application.Current.Dispatcher.Invoke(() =>
         {
-            if (isConnected)
+            try
             {
-                TrayIcon.IconSource = new System.Windows.Media.Imaging.BitmapImage(
-                    new Uri("pack://application:,,,/icon_connected.ico"));
-                TrayIcon.ToolTipText = "PcMqtt Agent (Подключено к брокеру)";
+                string iconName = isConnected ? "icon_connected.ico" : "icon_disconnected.ico";
+                Log.Information($"Загружаем иконку {iconName}");
+                string iconPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, iconName);
+                
+                if (File.Exists(iconPath))
+                {
+                    // Используем System.Drawing.Icon для надежной загрузки .ico файла
+                    Log.Information($"Загружаем иконку {iconPath}");
+                    var icon = new System.Drawing.Icon(iconPath);
+                    TrayIcon.Icon = icon;
+                }
+                
+                TrayIcon.ToolTipText = isConnected 
+                    ? "PcMqtt Agent (Подключено к брокеру)" 
+                    : "PcMqtt Agent (Отключено, идет переподключение...)";
             }
-            else
+            catch (Exception ex)
             {
-                TrayIcon.IconSource = new System.Windows.Media.Imaging.BitmapImage(
-                    new Uri("pack://application:,,,/icon_disconnected.ico"));
-                TrayIcon.ToolTipText = "PcMqtt Agent (Отключено, идет переподключение...)";
+                Log.Error(ex, "Ошибка смены иконки в трее.");
             }
         });
     }

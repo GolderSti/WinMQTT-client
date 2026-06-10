@@ -60,11 +60,12 @@ public partial class App : Application
 
             // 5. Запуск MQTT
             MqttService = new MqttService(Settings);
-            await MqttService.StartAsync();
 
             // 6. Показываем главное окно (скрытое)
             var mainWindow = new MainWindow();
             mainWindow.Show(); 
+            //чтобы правильно отобразить состояние в трее при подключении
+            await MqttService.StartAsync();
         }
         catch (Exception ex)
         {
