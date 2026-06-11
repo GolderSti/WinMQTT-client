@@ -28,6 +28,7 @@ public class MqttService : IDisposable
     private readonly Random _random = new();
 
     private Timer? _publishTimer;
+    private bool _isReConnecting;
     private bool _isConnected;
     private bool _isStopping;
 
@@ -63,7 +64,7 @@ public class MqttService : IDisposable
             .WithWillQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
             .WithWillRetain(true)
             .Build();
-
+        _isReConnecting=false;
         try
         {
             // Пытаемся подключиться при старте
@@ -79,6 +80,12 @@ public class MqttService : IDisposable
 
     private async Task ReconnectLoopAsync()
     {
+        if (_isReConnecting)
+        {//не запускаем ещё одну задачу если одна уже запущена
+            return;
+        }
+        _isReConnecting = true;
+
         while (!_cts.IsCancellationRequested && !_isStopping && !_mqttClient.IsConnected)
         {
 
@@ -87,9 +94,14 @@ public class MqttService : IDisposable
             try
             {
                 await _mqttClient.ConnectAsync(_mqttClient.Options, _cts.Token).ConfigureAwait(false);
+                _isReConnecting = false;
                 break; 
             }
-            catch (TaskCanceledException) { break; }
+            catch (TaskCanceledException) 
+            {
+                _isReConnecting = false; 
+                break; 
+            }
             catch (Exception ex)
             {
                 Log.Error(ex, "Ошибка переподключения. Будет новая попытка.");
@@ -103,6 +115,7 @@ public class MqttService : IDisposable
             Log.Warning($"Переподключение через {totalDelayMs / 1000.0:F1} сек. (Попытка #{_reconnectAttempts})");
             await Task.Delay(totalDelayMs, _cts.Token);
         }
+        _isReConnecting = false;
     }  
     private async Task OnConnectedAsync(MqttClientConnectedEventArgs e)
     {
@@ -135,8 +148,12 @@ public class MqttService : IDisposable
 
     private async Task OnDisconnectedAsync(MqttClientDisconnectedEventArgs e)
     {
+        if (_isConnected)
+        {
+            Log.Information("Отключено от MQTT брокера.");
+            NotifyConnectionStateChanged(false);
+        }
         _isConnected = false;
-        NotifyConnectionStateChanged(false);
         _publishTimer?.Change(Timeout.Infinite, Timeout.Infinite);
 
         if (_isStopping || _cts.IsCancellationRequested) 
@@ -152,8 +169,6 @@ public class MqttService : IDisposable
 
     private void NotifyConnectionStateChanged(bool isConnected)
     {
-        Log.Information("Отправляем NotifyConnectionStateChanged.");
-
         ConnectionStateChanged?.Invoke(isConnected);
     }
 
