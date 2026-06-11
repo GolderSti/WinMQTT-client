@@ -77,47 +77,33 @@ public class MqttService : IDisposable
         }
     }
 
-private async Task ReconnectLoopAsync()
-{
-    // Защита от запуска цикла, если мы уже подключены
-    if (_mqttClient.IsConnected) 
+    private async Task ReconnectLoopAsync()
     {
-        Log.Information("ReconnectLoop запущен, но соединение уже активно. Выход.");
-        return;
-    }
-
-    while (!_cts.IsCancellationRequested && !_isStopping)
-    {
-        _reconnectAttempts++;
-        int delayMs = (int)Math.Min(MaxDelayMs, BaseDelayMs * Math.Pow(2, _reconnectAttempts - 1));
-        int jitter = _random.Next(0, JitterMs);
-        int totalDelayMs = delayMs + jitter;
-
-        Log.Warning($"Переподключение через {totalDelayMs / 1000.0:F1} сек. (Попытка #{_reconnectAttempts})");
-        NotifyConnectionStateChanged(false);
-
-        try
+        while (!_cts.IsCancellationRequested && !_isStopping && !_mqttClient.IsConnected)
         {
-            await Task.Delay(totalDelayMs, _cts.Token);
-            
-            // КРИТИЧЕСКАЯ ПРОВЕРКА: За время задержки соединение могло восстановиться 
-            // (например, сработало событие OnConnectedAsync). Повторно вызывать ConnectAsync нельзя.
-            if (_mqttClient.IsConnected)
+
+            _reconnectAttempts++;
+
+            try
             {
-                Log.Information("Соединение уже установлено, выходим из цикла переподключения.");
-                break;
+                await _mqttClient.ConnectAsync(_mqttClient.Options, _cts.Token).ConfigureAwait(false);
+                break; 
+            }
+            catch (TaskCanceledException) { break; }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "Ошибка переподключения. Будет новая попытка.");
             }
 
-            await _mqttClient.ConnectAsync(_mqttClient.Options, _cts.Token).ConfigureAwait(false);
-            break; // Если ConnectAsync прошел успешно, выходим. Дальше сработает OnConnectedAsync.
+            int delaycnt = Math.Min(_reconnectAttempts, 32);
+            int delayMs = (int)Math.Min(MaxDelayMs, BaseDelayMs * Math.Pow(2, delaycnt - 1));
+            int jitter = _random.Next(0, JitterMs);
+            int totalDelayMs = delayMs + jitter;
+
+            Log.Warning($"Переподключение через {totalDelayMs / 1000.0:F1} сек. (Попытка #{_reconnectAttempts})");
+            await Task.Delay(totalDelayMs, _cts.Token);
         }
-        catch (TaskCanceledException) { break; }
-        catch (Exception ex)
-        {
-            Log.Error(ex, "Ошибка переподключения. Будет новая попытка.");
-        }
-    }
-}
+    }  
     private async Task OnConnectedAsync(MqttClientConnectedEventArgs e)
     {
         _isConnected = true;
