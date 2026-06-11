@@ -20,7 +20,6 @@ public partial class MainWindow : Window
     private void OnConnectionStateChanged(bool isConnected)
     {
         // Обновляем UI строго в главном потоке
-        Log.Information("Обновляем иконки в трее.");
         Application.Current.Dispatcher.Invoke(() =>
         {
             try
@@ -32,7 +31,6 @@ public partial class MainWindow : Window
                 if (File.Exists(iconPath))
                 {
                     // Используем System.Drawing.Icon для надежной загрузки .ico файла
-                    Log.Information($"Загружаем иконку {iconPath}");
                     var icon = new System.Drawing.Icon(iconPath);
                     TrayIcon.Icon = icon;
                 }
